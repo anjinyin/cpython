@@ -42,10 +42,17 @@ from math import log as _log, exp as _exp, pi as _pi, e as _e, ceil as _ceil
 from math import sqrt as _sqrt, acos as _acos, cos as _cos, sin as _sin
 from os import urandom as _urandom
 from _collections_abc import Set as _Set, Sequence as _Sequence
-from hashlib import sha512 as _sha512
 from itertools import accumulate as _accumulate, repeat as _repeat
 from bisect import bisect as _bisect
 import os as _os
+
+try:
+    # hashlib is pretty heavy to load, try lean internal module first
+    from _sha512 import sha512 as _sha512
+except ImportError:
+    # fallback to official implementation
+    from hashlib import sha512 as _sha512
+
 
 __all__ = ["Random","seed","random","uniform","randint","choice","sample",
            "randrange","shuffle","normalvariate","lognormvariate",
@@ -93,7 +100,7 @@ class Random(_random.Random):
         self.seed(x)
         self.gauss_next = None
 
-    def __init_subclass__(cls, **kwargs):
+    def __init_subclass__(cls, /, **kwargs):
         """Control how subclasses generate random integers.
 
         The algorithm a subclass can use depends on the random() and/or
@@ -114,7 +121,10 @@ class Random(_random.Random):
                 break
 
     def seed(self, a=None, version=2):
-        """Initialize internal state from hashable object.
+        """Initialize internal state from a seed.
+
+        The only supported seed types are None, int, float,
+        str, bytes, and bytearray.
 
         None or no argument seeds from current time or from an operating
         system specific randomness source if available.
@@ -136,11 +146,19 @@ class Random(_random.Random):
             x ^= len(a)
             a = -2 if x == -1 else x
 
-        if version == 2 and isinstance(a, (str, bytes, bytearray)):
+        elif version == 2 and isinstance(a, (str, bytes, bytearray)):
             if isinstance(a, str):
                 a = a.encode()
             a += _sha512(a).digest()
             a = int.from_bytes(a, 'big')
+
+        elif not isinstance(a, (type(None), int, float, str, bytes, bytearray)):
+            _warn('Seeding based on hashing is deprecated\n'
+                  'since Python 3.9 and will be removed in a subsequent '
+                  'version. The only \n'
+                  'supported seed types are: None, '
+                  'int, float, str, bytes, and bytearray.',
+                  DeprecationWarning, 2)
 
         super().seed(a)
         self.gauss_next = None
@@ -243,6 +261,8 @@ class Random(_random.Random):
     def _randbelow_with_getrandbits(self, n):
         "Return a random int in the range [0,n).  Raises ValueError if n==0."
 
+        if not n:
+            raise ValueError("Boundary cannot be zero")
         getrandbits = self.getrandbits
         k = n.bit_length()  # don't use (n-1) here because n can be 1
         r = getrandbits(k)          # 0 <= r < 2**k
@@ -347,9 +367,12 @@ class Random(_random.Random):
         # causing them to eat more entropy than necessary.
 
         if isinstance(population, _Set):
+            _warn('Sampling from a set deprecated\n'
+                  'since Python 3.9 and will be removed in a subsequent version.',
+                  DeprecationWarning, 2)
             population = tuple(population)
         if not isinstance(population, _Sequence):
-            raise TypeError("Population must be a sequence or set.  For dicts, use list(d).")
+            raise TypeError("Population must be a sequence.  For dicts or sets, use sorted(d).")
         randbelow = self._randbelow
         n = len(population)
         if not 0 <= k <= n:
@@ -395,8 +418,10 @@ class Random(_random.Random):
             raise TypeError('Cannot specify both weights and cumulative weights')
         if len(cum_weights) != n:
             raise ValueError('The number of weights does not match the population')
-        bisect = _bisect
         total = cum_weights[-1] + 0.0   # convert to float
+        if total <= 0.0:
+            raise ValueError('Total of weights must be greater than zero')
+        bisect = _bisect
         hi = n - 1
         return [population[bisect(cum_weights, random() * total, 0, hi)]
                 for i in _repeat(None, k)]
@@ -713,11 +738,17 @@ class SystemRandom(Random):
 
     def getrandbits(self, k):
         """getrandbits(k) -> x.  Generates an int with k random bits."""
-        if k <= 0:
-            raise ValueError('number of bits must be greater than zero')
+        if k < 0:
+            raise ValueError('number of bits must be non-negative')
         numbytes = (k + 7) // 8                       # bits / 8 and rounded up
         x = int.from_bytes(_urandom(numbytes), 'big')
         return x >> (numbytes * 8 - k)                # trim excess bits
+
+    def randbytes(self, n):
+        """Generate n random bytes."""
+        # os.urandom(n) fails with ValueError for n < 0
+        # and returns an empty bytes string for n == 0.
+        return _urandom(n)
 
     def seed(self, *args, **kwds):
         "Stub method.  Not used for a system random number generator."
@@ -799,6 +830,7 @@ weibullvariate = _inst.weibullvariate
 getstate = _inst.getstate
 setstate = _inst.setstate
 getrandbits = _inst.getrandbits
+randbytes = _inst.randbytes
 
 if hasattr(_os, "fork"):
     _os.register_at_fork(after_in_child=_inst.seed)
