@@ -1765,7 +1765,7 @@ ctxmanager_dealloc(PyDecContextManagerObject *self)
 {
     Py_XDECREF(self->local);
     Py_XDECREF(self->global);
-    PyObject_Del(self);
+    PyObject_Free(self);
 }
 
 static PyObject *
@@ -3186,6 +3186,31 @@ dotsep_as_utf8(const char *s)
     return utf8;
 }
 
+static int
+dict_get_item_string(PyObject *dict, const char *key, PyObject **valueobj, const char **valuestr)
+{
+    *valueobj = NULL;
+    PyObject *keyobj = PyUnicode_FromString(key);
+    if (keyobj == NULL) {
+        return -1;
+    }
+    PyObject *value = PyDict_GetItemWithError(dict, keyobj);
+    Py_DECREF(keyobj);
+    if (value == NULL) {
+        if (PyErr_Occurred()) {
+            return -1;
+        }
+        return 0;
+    }
+    value = PyUnicode_AsUTF8String(value);
+    if (value == NULL) {
+        return -1;
+    }
+    *valueobj = value;
+    *valuestr = PyBytes_AS_STRING(value);
+    return 0;
+}
+
 /* Formatted representation of a PyDecObject. */
 static PyObject *
 dec_format(PyObject *dec, PyObject *args)
@@ -3256,23 +3281,11 @@ dec_format(PyObject *dec, PyObject *args)
                 "optional argument must be a dict");
             goto finish;
         }
-        if ((dot = PyDict_GetItemString(override, "decimal_point"))) {
-            if ((dot = PyUnicode_AsUTF8String(dot)) == NULL) {
-                goto finish;
-            }
-            spec.dot = PyBytes_AS_STRING(dot);
-        }
-        if ((sep = PyDict_GetItemString(override, "thousands_sep"))) {
-            if ((sep = PyUnicode_AsUTF8String(sep)) == NULL) {
-                goto finish;
-            }
-            spec.sep = PyBytes_AS_STRING(sep);
-        }
-        if ((grouping = PyDict_GetItemString(override, "grouping"))) {
-            if ((grouping = PyUnicode_AsUTF8String(grouping)) == NULL) {
-                goto finish;
-            }
-            spec.grouping = PyBytes_AS_STRING(grouping);
+        if (dict_get_item_string(override, "decimal_point", &dot, &spec.dot) ||
+            dict_get_item_string(override, "thousands_sep", &sep, &spec.sep) ||
+            dict_get_item_string(override, "grouping", &grouping, &spec.grouping))
+        {
+            goto finish;
         }
         if (mpd_validate_lconv(&spec) < 0) {
             PyErr_SetString(PyExc_ValueError,
@@ -4138,7 +4151,6 @@ Dec_BoolFunc(mpd_isqnan)
 Dec_BoolFunc(mpd_issnan)
 Dec_BoolFunc(mpd_issigned)
 Dec_BoolFunc(mpd_iszero)
-Dec_BoolFunc(mpd_isinteger)
 
 /* Boolean functions, optional context arg */
 Dec_BoolFuncVA(mpd_isnormal)
@@ -4773,7 +4785,6 @@ static PyMethodDef dec_methods [] =
   { "is_snan", dec_mpd_issnan, METH_NOARGS, doc_is_snan },
   { "is_signed", dec_mpd_issigned, METH_NOARGS, doc_is_signed },
   { "is_zero", dec_mpd_iszero, METH_NOARGS, doc_is_zero },
-  { "is_integer", dec_mpd_isinteger, METH_NOARGS, doc_is_integer},
 
   /* Boolean functions, optional context arg */
   { "is_normal", (PyCFunction)(void(*)(void))dec_mpd_isnormal, METH_VARARGS|METH_KEYWORDS, doc_is_normal },
@@ -5185,7 +5196,6 @@ DecCtx_BoolFunc_NO_CTX(mpd_isqnan)
 DecCtx_BoolFunc_NO_CTX(mpd_issigned)
 DecCtx_BoolFunc_NO_CTX(mpd_issnan)
 DecCtx_BoolFunc_NO_CTX(mpd_iszero)
-DecCtx_BoolFunc_NO_CTX(mpd_isinteger)
 
 static PyObject *
 ctx_iscanonical(PyObject *context UNUSED, PyObject *v)
@@ -5467,7 +5477,6 @@ static PyMethodDef context_methods [] =
   { "is_snan", ctx_mpd_issnan, METH_O, doc_ctx_is_snan },
   { "is_subnormal", ctx_mpd_issubnormal, METH_O, doc_ctx_is_subnormal },
   { "is_zero", ctx_mpd_iszero, METH_O, doc_ctx_is_zero },
-  { "is_integer", ctx_mpd_isinteger, METH_O, doc_ctx_is_integer },
 
   /* Functions with a single decimal argument */
   { "_apply", PyDecContext_Apply, METH_O, NULL }, /* alias for apply */
@@ -5564,8 +5573,6 @@ static PyTypeObject PyDecContext_Type =
 /****************************************************************************/
 /*                                   C-API                                  */
 /****************************************************************************/
-
-static void *_decimal_api[CPYTHON_DECIMAL_MAX_API];
 
 /* Simple API */
 static int
@@ -5690,9 +5697,22 @@ PyDec_GetConst(const PyObject *v)
     return MPD(v);
 }
 
+static void
+destroy_api(PyObject *capsule)
+{
+    void *capi = PyCapsule_GetPointer(capsule, PyDec_CAPSULE_NAME);
+    PyMem_Free(capi);
+}
+
 static PyObject *
 init_api(void)
 {
+    void **_decimal_api = PyMem_Calloc(CPYTHON_DECIMAL_MAX_API, sizeof(void *));
+    if (_decimal_api == NULL) {
+        PyErr_NoMemory();
+        return NULL;
+    }
+
     /* Simple API */
     _decimal_api[PyDec_TypeCheck_INDEX] = (void *)PyDec_TypeCheck;
     _decimal_api[PyDec_IsSpecial_INDEX] = (void *)PyDec_IsSpecial;
@@ -5707,7 +5727,11 @@ init_api(void)
     _decimal_api[PyDec_Get_INDEX] = (void *)PyDec_Get;
     _decimal_api[PyDec_GetConst_INDEX] = (void *)PyDec_GetConst;
 
-    return PyCapsule_New(_decimal_api, "_decimal._API", NULL);
+    PyObject *capsule = PyCapsule_New(_decimal_api, PyDec_CAPSULE_NAME, destroy_api);
+    if (!capsule) {
+        PyMem_Free(_decimal_api);
+    }
+    return capsule;
 }
 
 
@@ -6071,8 +6095,7 @@ PyInit__decimal(void)
     CHECK_INT(PyModule_AddStringConstant(m, "__libmpdec_version__", mpd_version()));
 
     /* Add capsule API */
-    Py_INCREF(capsule);
-    if (PyModule_AddObject(m, "_API", capsule) < 0) {
+    if (PyModule_AddObjectRef(m, "_API", capsule) < 0) {
         goto error;
     }
 
@@ -6098,6 +6121,9 @@ error:
     Py_CLEAR(basic_context_template); /* GCOV_NOT_REACHED */
     Py_CLEAR(extended_context_template); /* GCOV_NOT_REACHED */
     Py_CLEAR(m); /* GCOV_NOT_REACHED */
+    Py_CLEAR(capsule); /* GCOV_NOT_REACHED */
 
     return NULL; /* GCOV_NOT_REACHED */
 }
+
+
